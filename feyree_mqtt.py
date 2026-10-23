@@ -335,7 +335,9 @@ class Gateway:
     def measurement_due(self, name, now):
         """Rafraichissement maximal pour les seules valeurs mesurees."""
         last = self.domo_last_sent.get(name)
-        return last is None or now - last >= self.measurement_refresh_seconds
+        period = (float(self.domoticz.get("power_publish_seconds", 60))
+                  if name == "power" else self.measurement_refresh_seconds)
+        return last is None or now - last >= period
 
     def publish_domoticz(self, name, nvalue, svalue, *,
                          trigger=False, refresh=False, now=None):
