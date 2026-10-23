@@ -53,6 +53,7 @@ les valeurs `null` par les **IDX de vos dispositifs existants** :
     "current": null,
     "power": null,
     "state": null,
+    "fault": null,
     "cp": null,
     "setpoint": null,
     "delay": null,
@@ -71,6 +72,7 @@ Le mapping est le suivant :
 | `current` | Courant Charge VE | DP 105 | A, division par 10 |
 | `power` | Puissance Charge VE | DP 109 | W, multiplication par 100 + cumul Wh |
 | `state` | État VE (texte) | DP 101 | Texte brut, **`charing`** compris |
+| `fault` | Défauts chargeur VE (texte) | DP 10 | Bitmap 16 bits décodé : `valeur - erreur1, erreur2` |
 | `cp` | Control Pilot (capteur personnalisé en V) | DP 127 | Valeur entière mesurée, par exemple 11/9/5 V |
 | `setpoint` | Consigne courant VE | DP 114 | A, synchronisation sans déclenchement |
 | `delay` | Durée départ différé (setpoint) | DP 118 | Heures entières, de 0 à 15 h, synchronisation sans déclenchement |
@@ -136,6 +138,50 @@ pendant l'attente, conformément à votre essai ; **aucun renouvellement
 automatique n'est ajouté dans la passerelle**. Cette décision restera dans
 vos scripts Domoticz.
 
+### Texte de diagnostic DP10 (bitmap `fault`)
+
+Créez un dispositif virtuel Domoticz de type **Text**, nommé par exemple
+« Défauts chargeur VE ». Placez son IDX dans `domoticz.idx.fault`.
+La passerelle conserve les bits du DP10 tels que le F-M24 les envoie
+et produit une chaîne de la forme :
+
+```text
+0 - aucune erreur
+1 - err_leak
+5 - err_leak, err_temp
+512 - err_ocp
+```
+
+Le décodage utilise l'ordre des 16 libellés fourni par **votre**
+`devices.json` Tuya :
+
+| Bit | Valeur | Libellé Tuya |
+|---:|---:|---|
+| 0 | 1 | `err_leak` |
+| 1 | 2 | `err_cp` |
+| 2 | 4 | `err_temp` |
+| 3 | 8 | `warn_a_uvp` |
+| 4 | 16 | `warn_b_uvp` |
+| 5 | 32 | `warn_c_uvp` |
+| 6 | 64 | `err_a_ovp` |
+| 7 | 128 | `err_b_ovp` |
+| 8 | 256 | `err_c_ovp` |
+| 9 | 512 | `err_ocp` |
+| 10 | 1024 | `err_10` |
+| 11 | 2048 | `err_11` |
+| 12 | 4096 | `err_esb` |
+| 13 | 8192 | `warn_pe_sck` |
+| 14 | 16384 | `err_leak_sck` |
+| 15 | 32768 | `err_pe` |
+
+Les éventuels bits non documentés sont indiqués comme
+`bit_16_inconnu`, etc., plutôt qu'ignorés.
+La remontée est **immédiate sur changement**, sans rafraîchissement
+à cinq minutes ; une resynchronisation a lieu après reconnexion MQTT.
+Aucune commande n'est envoyée au chargeur à partir de ce texte.
+Le diagnostic ne remplace pas les protections électriques intégrées
+au matériel.
+
 ### Rafraîchissement périodique des mesures (courbes Domoticz)
 
 En plus des publications **immédiates sur changement**, la passerelle
@@ -143,8 +189,12 @@ rafraîchit les mesures toutes les **300 secondes au maximum** (5 minutes)
 lorsqu'elle fonctionne et possède un dernier état du Feyree :
 
 - température `temperature` (DP110), tension `voltage` (DP102) ;
-- courant mesuré `current` (DP105), état texte `state` (DP101) ;
+- courant mesuré `current` (DP105) ;
 - CP `cp` (DP127).
+
+Les **champs texte** `state` (DP101) et `fault` (DP10)
+ne sont **pas rafraîchis périodiquement** : ils sont mis à jour
+uniquement lorsque leur valeur change ou lors d'une resynchronisation.
 
 La puissance / énergie `power` (DP109 + intégration) reste publiée
 au minimum toutes les `power_publish_seconds` secondes (60 s par défaut),
@@ -154,9 +204,10 @@ Les **setpoints `setpoint` et `delay`, ainsi que le `switch` /
 sélecteur**, ne sont **jamais** republiés pour ce seul motif. Ils sont
 synchronisés seulement lors de modifications ou reconnexions MQTT.
 
-Les rafraîchissements identiques de `state` et `cp` ont
-`parse: false` : **ils ne relancent pas vos événements Domoticz**.
-Les véritables transitions conservent `parse: true`.
+Les rafraîchissements identiques du `cp` ont `parse: false` :
+**ils ne relancent pas vos événements Domoticz**.
+Les véritables transitions des champs `state`, `fault` et `cp`
+conservent `parse: true`.
 
 Le paramètre optionnel `domoticz.measurement_refresh_seconds` vaut
 `300` par défaut, avec une plage autorisée de 10 à 300 secondes.
