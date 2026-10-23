@@ -25,6 +25,8 @@
       "cp": null,
       "setpoint": null,
       "switch": null
-    }
+    },
+    "topic_out": "domoticz/out",
+    "write_enabled": false
   }
 }
