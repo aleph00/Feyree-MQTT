@@ -85,6 +85,7 @@ class Gateway:
         self.available = False
         self.last_data = 0.0
         self.last_status = None
+        self.last_dp120_publish = None
         self.mqtt_connected = False
         self.next_command_query = None
         self.client = self._make_mqtt()
@@ -161,11 +162,36 @@ class Gateway:
         if not isinstance(dps, dict) or not dps:
             return False  # ACK ou heartbeat sans DP
         dps = {str(k): v for k, v in dps.items()}
+        previous_time = self.dps.get("120")
         changed = {k: v for k, v in dps.items() if k not in self.dps or self.dps[k] != v}
         self.dps.update(dps)
-        self.last_data = time.monotonic()
+        now = time.monotonic()
+        self.last_data = now
         self.set_available(True)
-        if changed:
+
+        # Le chargeur pousse DP120 (Ctime) chaque seconde en charge.
+        # On conserve toutes les mesures en mémoire, mais on réduit leur publication.
+        # Tout autre changement reste immédiat, y compris les changements du CP.
+        to_publish = {dp: value for dp, value in changed.items() if dp != "120"}
+        if "120" in changed:
+            period = float(self.cfg.get("dp120_publish_seconds", 30))
+            def as_seconds(value):
+                try:
+                    h, m, s = (int(x) for x in str(value).split(":"))
+                    return 3600 * h + 60 * m + s
+                except (TypeError, ValueError):
+                    return None
+
+            previous_seconds = as_seconds(previous_time) if previous_time is not None else None
+            current_seconds = as_seconds(self.dps["120"])
+            reset = (previous_seconds is not None and current_seconds is not None
+                     and current_seconds < previous_seconds)
+            if (to_publish or self.last_dp120_publish is None or
+                    now - self.last_dp120_publish >= period or reset):
+                to_publish["120"] = self.dps["120"]
+                self.last_dp120_publish = now
+
+        if to_publish:
             snapshot = {
                 "time": utc_now(),
                 "dps": dict(self.dps),
@@ -173,9 +199,9 @@ class Gateway:
             }
             self.last_status = snapshot
             self.publish(self.root + "/state", snapshot)
-            for dp, value in changed.items():
+            for dp, value in to_publish.items():
                 self.publish(self.root + "/dp/" + dp, value)
-            LOG.debug("DP modifiés : %s", changed)
+            LOG.debug("DP publiés : %s", to_publish)
         return True
 
     def _new_device(self):
@@ -287,6 +313,8 @@ def main():
             parser.error(f"Configuration manquante: {name}")
     if float(cfg.get("poll_seconds", 60)) < 10:
         parser.error("poll_seconds doit être >= 10")
+    if float(cfg.get("dp120_publish_seconds", 30)) < 0:
+        parser.error("dp120_publish_seconds doit être >= 0")
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     Gateway(cfg).run()
