@@ -388,3 +388,131 @@ def test_domoticz_delay_setpoint_rejects_invalid_values():
     assert m.translate_domoticz_command({'idx': 209, 'svalue1': '15'}, idx) == {
         'action': 'delay', 'value': 15
     }
+
+
+def test_domoticz_periodic_refresh_only_measurements(monkeypatch):
+    # Aucun DP ne change : les courbes doivent recevoir un point <= 300 s,
+    # sans réémettre le moindre setpoint ou sélecteur, ni réveiller les scripts.
+    clock = [100.0]
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    cfg = {'device_id': 'test', 'device_ip': '127.0.0.1',
+           'local_key': 'dummy',
+           'domoticz': {
+               'enabled': True, 'measurement_refresh_seconds': 300,
+               'idx': {'voltage': 201, 'current': 202,
+                       'temperature': 203, 'state': 205, 'cp': 208,
+                       'setpoint': 206, 'delay': 209, 'switch': 207}
+           }}
+    g = m.Gateway(cfg)
+    g.mqtt_connected = True
+    g.ingest({'dps': {'102': 2300, '105': 0, '110': 220,
+                      '101': 'finish', '127': 11, '114': 8,
+                      '118': 15, '124': 'CloseCharging'}})
+
+    def messages():
+        return [json.loads(p) for t, p in g.client.messages if t == 'domoticz/in']
+
+    assert len(messages()) == 8
+    clock[0] = 399.0
+    g.update_domoticz({}, clock[0])   # matériel vivant, aucune variation
+    assert len(messages()) == 8
+
+    clock[0] = 400.0
+    g.update_domoticz({}, clock[0])
+    later = messages()[8:]
+    assert {p['idx'] for p in later} == {201, 202, 203, 205, 208}
+    assert len(later) == 5
+    # Un simple rafraîchissement ne doit pas réveiller les timers Lua.
+    assert all(p['parse'] is False for p in later)
+
+    clock[0] = 401
+    g.ingest({'dps': {'127': 9}})
+    assert messages()[-1]['idx'] == 208
+    assert messages()[-1]['svalue'] == '9'
+    assert messages()[-1]['parse'] is True  # vraie transition CP
+
+
+def test_domoticz_stable_power_is_republished(monkeypatch):
+    from io import StringIO
+    clock = [100.0]
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(m, "urlopen",
+                        lambda url, timeout: StringIO(json.dumps(
+                            {"result": [{"Data": "100.000 kWh"}]})))
+    g = m.Gateway({
+        'device_id': 'test', 'device_ip': '127.0.0.1', 'local_key': 'dummy',
+        'domoticz': {'enabled': True, 'http_url': 'http://localhost:8080',
+                     'power_publish_seconds': 60, 'idx': {'power': 204}}
+    })
+    g.mqtt_connected = True
+    g.ingest({'dps': {'109': 0}})
+
+    def powers():
+        return [json.loads(p) for t, p in g.client.messages
+                if t == 'domoticz/in' and json.loads(p)['idx'] == 204]
+
+    assert len(powers()) == 1
+    assert powers()[0]['svalue'] == '0;100000'
+    clock[0] = 159.9
+    g.update_domoticz({}, clock[0])
+    assert len(powers()) == 1
+    clock[0] = 160
+    g.update_domoticz({}, clock[0])
+    assert len(powers()) == 2
+    assert powers()[-1]['svalue'] == '0;100000'
+    clock[0] = 400
+    g.update_domoticz({}, clock[0])
+    assert len(powers()) == 3
+
+
+def test_selector_commands_use_level_not_nvalue():
+    idx = {'switch': 207}
+    tr = lambda p: m.translate_domoticz_command(p, idx, 'selector')
+    assert tr({'idx': 207, 'nvalue': 0, 'svalue1': '0'}) == {'action': 'stop'}
+    assert tr({'idx': 207, 'nvalue': 2, 'svalue1': '10'}) == {'action': 'wait'}
+    assert tr({'idx': 207, 'nvalue': 1, 'svalue1': '20'}) == {'action': 'start'}
+    # Certaines versions de Domoticz utilisent nvalue=2 pour les deux niveaux.
+    assert tr({'idx': 207, 'nvalue': 2, 'svalue1': '20'}) == {'action': 'start'}
+    for value in ('5', '30', '10.5', '', None):
+        try:
+            tr({'idx': 207, 'svalue1': value})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'Niveau inattendu accepté : {value!r}')
+
+    # Le mode interrupteur historique reste inchangé par défaut.
+    assert m.translate_domoticz_command(
+        {'idx': 207, 'nvalue': 1}, idx) == {'action': 'start'}
+
+
+def test_selector_device_reflects_wait_start_stop(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    g = m.Gateway({
+        'device_id': 'test', 'device_ip': '127.0.0.1', 'local_key': 'dummy',
+        'domoticz': {'enabled': True, 'write_enabled': True,
+                     'switch_mode': 'selector', 'idx': {'switch': 207}}
+    })
+    g.mqtt_connected = True
+    for operation in ('WaitOperation', 'OpenCharging', 'CloseCharging'):
+        g.ingest({'dps': {'124': operation}})
+        clock[0] += 1
+    updates = [json.loads(p) for t, p in g.client.messages
+               if t == 'domoticz/in']
+    assert [(p['nvalue'], p['svalue']) for p in updates] == [
+        (1, '10'), (1, '20'), (0, '0')]
+    assert all(p['parse'] is False for p in updates)
+
+    # Les consignes retour de Domoticz passent par la même file sécurisée.
+    for level, action, dp_value in [
+        ('10', 'wait', 'WaitOperation'),
+        ('20', 'start', 'OpenCharging'),
+        ('0', 'stop', 'CloseCharging')
+    ]:
+        msg = types.SimpleNamespace(topic='domoticz/out', retain=False,
+                payload=json.dumps({'idx': 207, 'nvalue': 2,
+                                    'svalue1': level}).encode())
+        g.on_message(None, None, msg)
+        obj, dp, value = g.queue.get_nowait()
+        assert (obj['action'], dp, value) == (action, 124, dp_value)
