@@ -23,11 +23,11 @@ Avec `topic: "feyree"` :
 |---|---|---|
 | `feyree/availability` | `online` / `offline` suivant réception effective des états | oui |
 | `feyree/state` | JSON complet des DP **mis en cache** + champs décodés + horodatage de la dernière modification | oui |
-| `feyree/dp/127` (etc.) | Valeur JSON du DP correspondant, uniquement à chaque changement | oui |
+| `feyree/dp/127` (etc.) | Valeur JSON du DP correspondant, à chaque changement (DP120 limité en fréquence) | oui |
 | `feyree/set` | Commande JSON envoyée depuis Domoticz | **non** |
 | `feyree/ack` | JSON `sent_not_confirmed` ou erreur | non |
 
-`feyree/state` conserve les DP déjà connus lorsqu'une notification partielle ne contient que le DP 120. Les données peuvent être anciennes après déconnexion : **vérifiez `feyree/availability`**. Les valeurs publiées dans `decoded` proviennent du mapping F-M24 que nous avons relevé. La remontée immédiate des transitions CP dépend de ce que le firmware pousse effectivement : **à mesurer**.
+`feyree/state` conserve les DP déjà connus lorsqu'une notification partielle ne contient que le DP 120. Le Feyree émet le compteur de durée **DP120 toutes les secondes pendant la charge** : pour éviter les publications MQTT inutiles, la passerelle garde toutes les valeurs dans son cache mais n'en publie qu'une toutes les **30 secondes par défaut** (avec le snapshot `feyree/state`). Une variation d’un autre DP reste publiée immédiatement, ainsi qu’une remise à zéro du compteur. Modifier `dp120_publish_seconds` dans `config.json` pour ajuster ce délai (`0` pour tout publier). Les données peuvent être anciennes après déconnexion : **vérifiez `feyree/availability`**. Les valeurs publiées dans `decoded` proviennent du mapping F-M24 que nous avons relevé. La remontée immédiate des transitions CP dépend de ce que le firmware pousse effectivement : **à mesurer**.
 
 ## Commandes
 
@@ -40,7 +40,7 @@ mosquitto_pub -t feyree/set -m '{"action":"delay","value":15}'
 mosquitto_pub -t feyree/set -m '{"action":"wait"}'
 ```
 
-`start` = DP124 `OpenCharging`, `stop` = DP124 `CloseCharging`, `current` = DP114 (8–16 A), `delay` = DP118 (0–15 heures). **Aucun essai en dessous de 8 A n'est automatisé.** `wait` = `WaitOperation` à titre de diagnostic : on sait que cela ne verrouille pas le prochain branchement. Les commandes MQTT retained sont refusées pour éviter des départs intempestifs après reconnexion. Les accusés de réception `sent_not_confirmed` signifient uniquement « commande transmise à TinyTuya » ; vérifiez le DP retourné et l'effet réel.
+`start` = DP124 `OpenCharging`, `stop` = DP124 `CloseCharging`, `current` = DP114 (8–16 A), `delay` = DP118 (0–15 heures). **Aucun essai en dessous de 8 A n'est automatisé.** `wait` = DP124 `WaitOperation` : **pause de la charge sans remise à zéro des compteurs d’énergie et de durée**, constatée expérimentalement. À la différence de `stop`, cette commande ne clôture pas la session ; elle ne verrouille toutefois pas la prochaine connexion du véhicule. Les commandes MQTT retained sont refusées pour éviter des départs intempestifs après reconnexion. Les accusés de réception `sent_not_confirmed` signifient uniquement « commande transmise à TinyTuya » ; vérifiez le DP retourné et l'effet réel.
 
 ```sh
 mosquitto_sub -v -t 'feyree/#'
@@ -48,7 +48,7 @@ mosquitto_sub -v -t 'feyree/#'
 
 ## Stratégie de fonctionnement
 
-La passerelle garde une socket TCP persistante ; elle interroge l'état initial puis écoute `receive()`. Elle envoie un heartbeat toutes les 20 s, effectue un polling de secours toutes les 60 s par défaut et se reconnecte avec backoff. Un seul thread accède à la socket TinyTuya, ce qui évite les accès concurrents du callback MQTT. Pas de logique autonome `delay=15` ni d'autorisation de charge : à ajouter seulement lorsque le test de renouvellement du différé sera validé. En cas de redémarrage du Feyree, son différé s'efface selon vos essais : **ce script ne constitue pas un verrouillage de sécurité**.
+La passerelle garde une socket TCP persistante ; elle interroge l'état initial puis écoute `receive()`. Elle envoie un heartbeat toutes les 20 s, effectue un polling de secours toutes les 60 s par défaut et se reconnecte avec backoff. Un seul thread accède à la socket TinyTuya, ce qui évite les accès concurrents du callback MQTT. Pas de logique autonome `delay=15` ni d’autorisation de charge : cette stratégie sera ajoutée ultérieurement dans Domoticz. **Le renouvellement d’un délai différé pendant l’attente a été validé expérimentalement** ; il reste à coder sa politique d’utilisation. En cas de redémarrage du Feyree, son différé s'efface selon vos essais : **ce script ne constitue pas un verrouillage de sécurité**.
 
 ## Signal Control Pilot : DP 127 (`cp`)
 
