@@ -227,3 +227,101 @@ def test_read_domoticz_energy_wh_accepts_real_counter(monkeypatch):
 
     monkeypatch.setattr(m, "urlopen", fake_api)
     assert m.read_domoticz_energy_wh("http://localhost:8080", 204) == 2825173.0
+
+
+def test_domoticz_out_to_feyree_commands():
+    idx = {"setpoint": 206, "switch": 207}
+    translate = m.translate_domoticz_command
+
+    assert translate({"idx": 206, "svalue1": "13.0"}, idx) == {
+        "action": "current", "value": 13
+    }
+    assert translate({"idx": "207", "nvalue": 1, "svalue1": "On"}, idx) == {
+        "action": "start"
+    }
+    assert translate({"idx": 207, "nvalue": 0}, idx) == {"action": "stop"}
+    assert translate({"idx": 207, "svalue1": "Off"}, idx) == {"action": "stop"}
+    assert translate({"idx": 208, "nvalue": 1}, idx) is None
+    assert translate({"nvalue": 1}, idx) is None
+
+    for value in ["7", "17", "8.5", "NaN", "", None]:
+        try:
+            translate({"idx": 206, "svalue1": value}, idx)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Commande invalide acceptée : {value!r}")
+
+
+def test_domoticz_out_route_opt_in_retained_and_offline():
+    cfg = {
+        'device_id': 'test', 'device_ip': '127.0.0.1',
+        'local_key': 'dummy', 'domoticz': {
+            'enabled': True,
+            'write_enabled': True,
+            'topic_out': 'domoticz/out',
+            'idx': {'setpoint': 206, 'switch': 207}
+        }
+    }
+    g = m.Gateway(cfg)
+    # Le mode écriture n'envoie jamais de commande si Feyree est hors ligne.
+    msg = types.SimpleNamespace(
+        topic='domoticz/out',
+        payload=b'{"idx":207,"nvalue":1}', retain=False)
+    g.on_message(None, None, msg)
+    assert g.queue.empty()
+    assert json.loads(g.client.messages[-1][1])['ok'] is False
+
+    g.set_available(True)
+    msg.retain = True
+    g.on_message(None, None, msg)
+    assert g.queue.empty()
+
+    msg.retain = False
+    g.on_message(None, None, msg)
+    assert g.queue.get_nowait() == ({'action': 'start'}, 124, 'OpenCharging')
+
+    msg.payload = b'{"idx":206,"svalue1":"10.0"}'
+    g.on_message(None, None, msg)
+    assert g.queue.get_nowait() == (
+        {'action': 'current', 'value': 10}, 114, 10)
+
+    # Les autres dispositifs ne déclenchent rien.
+    msg.payload = b'{"idx":999,"nvalue":1}'
+    g.on_message(None, None, msg)
+    assert g.queue.empty()
+
+    # Un topic inexistant/quelconque n'est jamais interprete.
+    msg.topic = 'domoticz/in'
+    msg.payload = b'{"idx":207,"nvalue":0}'
+    g.on_message(None, None, msg)
+    assert g.queue.empty()
+
+    # L'intégration reste facultative (désactivée = aucune commande Domoticz).
+    cfg['domoticz']['write_enabled'] = False
+    g2 = m.Gateway(cfg)
+    g2.set_available(True)
+    msg.topic = 'domoticz/out'
+    g2.on_message(None, None, msg)
+    assert g2.queue.empty()
+
+
+def test_domoticz_on_connect_subscribes_only_when_write_enabled():
+    g = m.Gateway({'device_id': 'test', 'device_ip': '127.0.0.1',
+                   'local_key': 'dummy',
+                   'domoticz': {'enabled': True, 'write_enabled': True,
+                                'idx': {'setpoint': 206}}})
+    subscribed = []
+    g.client.subscribe = lambda topic, qos=0: subscribed.append((topic, qos))
+    g.on_connect(g.client, None, None, 0)
+    assert ('feyree/set', 1) in subscribed
+    assert ('domoticz/out', 1) in subscribed
+
+    g2 = m.Gateway({'device_id': 'test', 'device_ip': '127.0.0.1',
+                    'local_key': 'dummy',
+                    'domoticz': {'enabled': True, 'write_enabled': False,
+                                 'idx': {'setpoint': 206}}})
+    subscribed2 = []
+    g2.client.subscribe = lambda topic, qos=0: subscribed2.append((topic, qos))
+    g2.on_connect(g2.client, None, None, 0)
+    assert ('domoticz/out', 1) not in subscribed2
