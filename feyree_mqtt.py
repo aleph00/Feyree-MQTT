@@ -9,12 +9,14 @@ import argparse
 import json
 import logging
 import queue
+import re
 import signal
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.request import urlopen
 
 import tinytuya
 import paho.mqtt.client as mqtt
@@ -76,6 +78,25 @@ def translate_command(obj):
     raise ValueError("Action inconnue (start, stop, wait, current, delay, status)")
 
 
+def read_domoticz_energy_wh(base_url, idx):
+    """Lit le total existant du compteur Domoticz (sans jamais le réinitialiser).
+
+    Le champ Data de l'API Domoticz est exprimé en kWh pour un
+    dispositif Electricity (instant + counter).
+    """
+    url = base_url.rstrip("/") + "/json.htm?type=command&param=getdevices&rid=" + str(idx)
+    with urlopen(url, timeout=3) as response:
+        answer = json.load(response)
+    results = answer.get("result") or []
+    if not results:
+        raise ValueError("Compteur Domoticz introuvable (IDX %s)" % idx)
+    data = str(results[0].get("Data", ""))
+    match = re.fullmatch(r"\\s*([0-9]+(?:[.,][0-9]+)?)\\s*kWh\\s*", data, re.I)
+    if not match:
+        raise ValueError("Total compteur inattendu : %r (kWh attendu)" % data)
+    return float(match.group(1).replace(",", ".")) * 1000.0
+
+
 class Gateway:
     def __init__(self, config):
         self.cfg = config
@@ -87,6 +108,17 @@ class Gateway:
         self.last_status = None
         self.last_dp120_publish = None
         self.mqtt_connected = False
+        self.domoticz = config.get("domoticz") or {}
+        self.domo_enabled = bool(self.domoticz.get("enabled", False))
+        self.domo_idx = self.domoticz.get("idx") or {}
+        self.domo_topic = self.domoticz.get("topic_in", "domoticz/in")
+        self.domo_last = {}
+        self.domo_sync_needed = True
+        self.energy_wh = None
+        self.energy_last_ts = None
+        self.energy_last_w = None
+        self.last_power_pub = None
+        self.energy_retry_at = 0.0
         self.next_command_query = None
         self.client = self._make_mqtt()
 
@@ -111,6 +143,7 @@ class Gateway:
             LOG.error("Connexion MQTT refusée : %s", reason_code)
             return
         self.mqtt_connected = True
+        self.domo_sync_needed = True
         client.subscribe(self.root + "/set", qos=1)
         # Une reconnexion du broker ne transforme pas un état périmé en état frais.
         self.publish_availability()
@@ -168,6 +201,8 @@ class Gateway:
         now = time.monotonic()
         self.last_data = now
         self.set_available(True)
+        if self.domo_enabled:
+            self.update_domoticz(changed, now)
 
         # Le chargeur pousse DP120 (Ctime) chaque seconde en charge.
         # On conserve toutes les mesures en mémoire, mais on réduit leur publication.
@@ -203,6 +238,88 @@ class Gateway:
                 self.publish(self.root + "/dp/" + dp, value)
             LOG.debug("DP publiés : %s", to_publish)
         return True
+
+
+    def publish_domoticz(self, name, nvalue, svalue, *, trigger=False):
+        """Mise à jour d'un dispositif existant, identifie par son IDX."""
+        idx = self.domo_idx.get(name)
+        if not idx or not self.mqtt_connected:
+            return
+        payload = {"command": "udevice", "idx": int(idx),
+                   "nvalue": nvalue, "svalue": str(svalue),
+                   "parse": bool(trigger)}
+        signature = (nvalue, str(svalue))
+        if self.domo_sync_needed or self.domo_last.get(name) != signature:
+            self.publish(self.domo_topic, payload, retain=False)
+            self.domo_last[name] = signature
+
+    def ensure_energy_seed(self, now):
+        """Recupere le compteur deja existant dans Domoticz avant toute ecriture."""
+        if not self.domo_idx.get("power") or self.energy_wh is not None:
+            return
+        if now < self.energy_retry_at:
+            return
+        self.energy_retry_at = now + 60
+        base = self.domoticz.get("http_url")
+        if not base:
+            LOG.warning("IDX power configure mais domoticz.http_url absent : "
+                        "compteur d'energie non modifie")
+            return
+        try:
+            self.energy_wh = read_domoticz_energy_wh(base, self.domo_idx["power"])
+            LOG.info("Compteur d'energie Domoticz repris a %.1f Wh", self.energy_wh)
+        except Exception as exc:
+            # Fail closed : on ne publie jamais 'puissance;0' qui effacerait le total.
+            LOG.warning("Impossible de lire l'index d'energie existant : %s", exc)
+
+    def update_domoticz(self, changed, now):
+        """Publie les mesures en MQTT /domoticz/in; sans aucune decision de charge."""
+        if not self.domo_enabled:
+            return
+        self.ensure_energy_seed(now)
+        dps = self.dps
+        force = self.domo_sync_needed
+        scalar = (
+            ("110", "temperature", lambda v: v / 10.0),
+            ("102", "voltage", lambda v: v / 10.0),
+            ("105", "current", lambda v: v / 10.0),
+            ("101", "state", str),
+            ("114", "setpoint", int),
+        )
+        for dp, name, conversion in scalar:
+            if dp in dps and (force or dp in changed):
+                value = conversion(dps[dp])
+                # L'etat doit generer un evenement Domoticz pour les automatismes.
+                # Les synchronisations de consigne ne doivent pas produire de boucles.
+                self.publish_domoticz(name, 0, value, trigger=(name == "state"))
+
+        if "124" in dps and (force or "124" in changed):
+            operation = dps["124"]
+            # WaitOperation = pause ; on n'impose pas Off sur un switch On/Off.
+            if operation == "OpenCharging":
+                self.publish_domoticz("switch", 1, "On")
+            elif operation == "CloseCharging":
+                self.publish_domoticz("switch", 0, "Off")
+
+        if "109" in dps:
+            power_w = max(0.0, float(dps["109"]) * 100.0)
+            # Integration avec le temps reel, et NON +P/60 a chaque evenement.
+            if self.energy_wh is not None and self.energy_last_ts is not None:
+                dt = now - self.energy_last_ts
+                if 0 < dt <= 120 and self.energy_last_w is not None:
+                    self.energy_wh += self.energy_last_w * dt / 3600.0
+            self.energy_last_ts = now
+            self.energy_last_w = power_w
+            publish_due = (force or "109" in changed or
+                           self.last_power_pub is None or
+                           now - self.last_power_pub >=
+                           float(self.domoticz.get("power_publish_seconds", 60)))
+            if self.energy_wh is not None and publish_due:
+                self.publish_domoticz("power", 0,
+                    "%s;%d" % (format(power_w, "g"), round(self.energy_wh)))
+                self.last_power_pub = now
+        if self.mqtt_connected:
+            self.domo_sync_needed = False
 
     def _new_device(self):
         dev = tinytuya.OutletDevice(
@@ -250,6 +367,8 @@ class Gateway:
                 dev = None
                 try:
                     dev = self._new_device()
+                    # Ne pas extrapoler la puissance pendant une interruption TCP.
+                    self.energy_last_ts = None
                     self.last_data = time.monotonic()
                     # La méthode nowait ouvre la connexion et initie l'état initial.
                     dev.status(nowait=True)
@@ -317,6 +436,15 @@ def main():
         parser.error("dp120_publish_seconds doit être >= 0")
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
+    dz = cfg.get("domoticz") or {}
+    if dz.get("enabled"):
+        indices = dz.get("idx") or {}
+        for field, idx in indices.items():
+            if idx is not None and (isinstance(idx, bool) or not
+                                    str(idx).isdigit() or int(idx) <= 0):
+                parser.error(f"domoticz.idx.{field} doit etre un IDX positif ou null")
+        if float(dz.get("power_publish_seconds", 60)) < 5:
+            parser.error("domoticz.power_publish_seconds doit etre >= 5")
     Gateway(cfg).run()
 
 
