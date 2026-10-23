@@ -131,8 +131,8 @@ def test_domoticz_mqtt_mapping_and_energy_continuity(monkeypatch):
                'enabled': True, 'http_url': 'http://127.0.0.1:8080',
                'power_publish_seconds': 30,
                'idx': {'temperature': 200, 'voltage': 201, 'current': 202,
-                       'power': 204, 'state': 205, 'setpoint': 206,
-                       'switch': 207}
+                       'power': 204, 'state': 205, 'cp': 208,
+                       'setpoint': 206, 'switch': 207}
            }}
     g = m.Gateway(cfg)
     g.mqtt_connected = True
@@ -148,6 +148,8 @@ def test_domoticz_mqtt_mapping_and_energy_continuity(monkeypatch):
     assert by_idx[204]['svalue'] == '1800;4250'
     assert by_idx[205]['svalue'] == 'charing'
     assert by_idx[205]['parse'] is True
+    assert by_idx[208]['svalue'] == '5'
+    assert by_idx[208]['parse'] is True
     assert by_idx[206]['svalue'] == '8'
     assert by_idx[206]['parse'] is False
     assert by_idx[207]['nvalue'] == 1
@@ -194,3 +196,21 @@ def test_domoticz_energy_unavailable_does_not_reset_counter(monkeypatch):
     assert any(v['idx'] == 201 for v in payloads)
     assert not any(v['idx'] == 204 for v in payloads)
     assert g.energy_wh is None
+
+
+def test_cp_change_triggers_immediate_domoticz_update(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    g = m.Gateway({'device_id': 'test', 'device_ip': '127.0.0.1',
+                   'local_key': 'dummy',
+                   'domoticz': {'enabled': True, 'idx': {'cp': 208}}})
+    g.mqtt_connected = True
+    g.ingest({'dps': {'127': 11}})
+    clock[0] += 0.5
+    g.ingest({'dps': {'127': 9}})
+    clock[0] += 0.5
+    g.ingest({'dps': {'127': 5}})
+    messages = [json.loads(payload) for topic, payload in g.client.messages
+                if topic == 'domoticz/in']
+    assert [msg['svalue'] for msg in messages] == ['11', '9', '5']
+    assert all(msg['idx'] == 208 and msg['parse'] is True for msg in messages)
