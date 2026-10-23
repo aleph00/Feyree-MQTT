@@ -1,0 +1,20 @@
+[Unit]
+Description=Feyree F-M24 vers MQTT (TinyTuya local)
+Wants=network-online.target
+After=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=feyree
+Group=feyree
+WorkingDirectory=/opt/feyree-mqtt
+ExecStart=/opt/feyree-mqtt/.venv/bin/python /opt/feyree-mqtt/feyree_mqtt.py --config /etc/feyree-mqtt/config.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
