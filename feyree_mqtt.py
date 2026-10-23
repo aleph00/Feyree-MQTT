@@ -91,7 +91,7 @@ def read_domoticz_energy_wh(base_url, idx):
     if not results:
         raise ValueError("Compteur Domoticz introuvable (IDX %s)" % idx)
     data = str(results[0].get("Data", ""))
-    match = re.fullmatch(r"\\s*([0-9]+(?:[.,][0-9]+)?)\\s*kWh\\s*", data, re.I)
+    match = re.fullmatch(r"\s*([0-9]+(?:[.,][0-9]+)?)\s*kWh\s*", data, re.I)
     if not match:
         raise ValueError("Total compteur inattendu : %r (kWh attendu)" % data)
     return float(match.group(1).replace(",", ".")) * 1000.0
