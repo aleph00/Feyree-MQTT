@@ -62,7 +62,7 @@ def translate_command(obj):
     if action == "stop":
         return 124, "CloseCharging"
     if action == "wait":
-        return 124, "WaitOperation"  # conservé pour diagnostic, pas un verrou
+        return 124, "WaitOperation"  # pause sans RAZ des compteurs, pas un verrou
     if action in ("current", "delay"):
         value = obj.get("value")
         if isinstance(value, bool) or not isinstance(value, int):
