@@ -49,6 +49,7 @@ les valeurs `null` par les **IDX de vos dispositifs existants** :
     "current": null,
     "power": null,
     "state": null,
+    "cp": null,
     "setpoint": null,
     "switch": null
   }
@@ -65,6 +66,7 @@ Le mapping est le suivant :
 | `current` | Courant Charge VE | DP 105 | A, division par 10 |
 | `power` | Puissance Charge VE | DP 109 | W, multiplication par 100 + cumul Wh |
 | `state` | État VE (texte) | DP 101 | Texte brut, **`charing`** compris |
+| `cp` | Control Pilot (capteur personnalisé en V) | DP 127 | Valeur entière mesurée, par exemple 11/9/5 V |
 | `setpoint` | Consigne courant VE | DP 114 | A, synchronisation sans déclenchement |
 | `switch` | Marche/arrêt VE | DP 124 | `OpenCharging` → On ; `CloseCharging` → Off |
 
@@ -76,9 +78,15 @@ Les commandes sont uniquement **des remontées d'état vers Domoticz**. Les
 actions *de Domoticz vers le Feyree* restent celles de vos scripts existants ;
 pour les transférer en local, utilisez les commandes MQTT sur `feyree/set`.
 Les valeurs miroir du setpoint et du switch sont publiées avec
-`parse: false` pour éviter de déclencher une boucle de commandes ; l'état
-`state` est publié avec `parse: true` afin de pouvoir déclencher un événement
-Domoticz lors d'un changement.
+`parse: false` pour éviter de déclencher une boucle de commandes ; **`state`
+et `cp` sont publiés avec `parse: true`** afin de permettre à vos
+automatismes Domoticz de réagir immédiatement aux changements.
+
+Le CP conserve les valeurs **brutes du DP 127**, sans conversion en état
+logique. Vos relevés du F-M24 sont : **11 V** voiture absente, **9 V**
+voiture branchée en attente, **5 V** en charge. Vous pourrez ainsi
+exploiter directement le passage `11 → 9` pour armer le différé,
+sans que la passerelle décide elle-même quand charger.
 
 ### Conservation du compteur d'énergie
 
@@ -114,7 +122,7 @@ jour du dispositif `state` (ou équivalent dzVents), afin de maintenir le
 timer et ses `Off AFTER 300` existants.
 
 **Test recommandé :** activez d'abord uniquement les IDX `state`,
-`voltage`, `current` et `setpoint`, puis `power` après avoir vérifié
+`cp`, `voltage`, `current` et `setpoint`, puis `power` après avoir vérifié
 que l'API retourne bien le total d'énergie. Un IDX invalide ne doit jamais
 être remplacé par un nouvel IDX créé pour l'occasion.
 
