@@ -43,6 +43,8 @@ les valeurs `null` par les **IDX de vos dispositifs existants** :
   "topic_in": "domoticz/in",
   "topic_out": "domoticz/out",
   "write_enabled": false,
+  "switch_mode": "switch",
+  "measurement_refresh_seconds": 300,
   "http_url": "http://127.0.0.1:8080",
   "power_publish_seconds": 60,
   "idx": {
@@ -72,11 +74,12 @@ Le mapping est le suivant :
 | `cp` | Control Pilot (capteur personnalisé en V) | DP 127 | Valeur entière mesurée, par exemple 11/9/5 V |
 | `setpoint` | Consigne courant VE | DP 114 | A, synchronisation sans déclenchement |
 | `delay` | Durée départ différé (setpoint) | DP 118 | Heures entières, de 0 à 15 h, synchronisation sans déclenchement |
-| `switch` | Marche/arrêt VE | DP 124 | `OpenCharging` → On ; `CloseCharging` → Off |
+| `switch` | Interrupteur ou sélecteur de charge VE | DP 124 | Mode sélecteur : 0=Off, 10=Pause, 20=On |
 
-`WaitOperation` étant une **pause**, le switch On/Off existant n'est pas
-modifié dans ce cas. Le passage à un sélecteur Off/On/Pause sera une évolution
-distincte si souhaité.
+En mode historique `"switch_mode": "switch"`, `WaitOperation` ne change
+pas l'interrupteur On/Off. En mode `"switch_mode": "selector"`, les trois
+états DP124 sont reflétés par le sélecteur 0=Off / 10=Pause / 20=On,
+avec `parse: false` pour ne pas renvoyer de commandes en boucle.
 
 Les remontées d'état vers Domoticz fonctionnent dès que `domoticz.enabled`
 est à `true`. Le trajet inverse est **facultatif**, avec
@@ -94,19 +97,22 @@ La passerelle écoute alors `domoticz/out` et n'interprète que les IDX
 | Setpoint modifié à 8…16 A | DP114 = intensité demandée |
 | Durée départ différé modifiée à 0…15 h | DP118 = nouvelle durée de différé |
 | Switch On | DP124 = `OpenCharging` |
-| Switch Off | DP124 = `CloseCharging` |
+| Switch Off (mode historique) | DP124 = `CloseCharging` |
+| Sélecteur niveau 0 — Off | DP124 = `CloseCharging` |
+| Sélecteur niveau 10 — Pause | DP124 = `WaitOperation` |
+| Sélecteur niveau 20 — On | DP124 = `OpenCharging` |
 
 Un message `domoticz/out` ne correspondant pas à ces trois IDX est ignoré.
 Les commandes retenues MQTT, non valides, ou reçues pendant que le Feyree
 est hors ligne ne sont **jamais rejouées**. Les commandes directes sur
-`feyree/set` continuent de fonctionner. Le bouton **Pause** n'est
-pas encore géré par le switch On/Off : il reste accessible par
-`{"action":"wait"}` sur `feyree/set`.
+`feyree/set` continuent de fonctionner. La commande **Pause** est disponible sur le sélecteur 0/10/20
+si `domoticz.switch_mode` vaut `"selector"`; la commande
+`{"action":"wait"}` sur `feyree/set` reste également possible.
 
 **Évitez d'exécuter en parallèle votre ancienne logique Lua d'envoi
 de commandes vers Tuya** : elle pourrait doubler ou contredire les
 commandes prises en charge par `domoticz/out`.
-Les valeurs miroir des deux setpoints (courant et différé) et du switch sont publiées avec
+Les valeurs miroir des deux setpoints (courant et différé) et du switch/sélecteur sont publiées avec
 `parse: false` pour éviter de déclencher une boucle de commandes ; **`state`
 et `cp` sont publiés avec `parse: true`** afin de permettre à vos
 automatismes Domoticz de réagir immédiatement aux changements.
@@ -129,6 +135,62 @@ DP118 est reçu. L'envoi répété de `15` peut renouveler le différé
 pendant l'attente, conformément à votre essai ; **aucun renouvellement
 automatique n'est ajouté dans la passerelle**. Cette décision restera dans
 vos scripts Domoticz.
+
+### Rafraîchissement périodique des mesures (courbes Domoticz)
+
+En plus des publications **immédiates sur changement**, la passerelle
+rafraîchit les mesures toutes les **300 secondes au maximum** (5 minutes)
+lorsqu'elle fonctionne et possède un dernier état du Feyree :
+
+- température `temperature` (DP110), tension `voltage` (DP102) ;
+- courant mesuré `current` (DP105), état texte `state` (DP101) ;
+- CP `cp` (DP127).
+
+La puissance / énergie `power` (DP109 + intégration) reste publiée
+au minimum toutes les `power_publish_seconds` secondes (60 s par défaut),
+même lorsqu'elle ne varie pas, et immédiatement lorsqu'elle change.
+
+Les **setpoints `setpoint` et `delay`, ainsi que le `switch` /
+sélecteur**, ne sont **jamais** republiés pour ce seul motif. Ils sont
+synchronisés seulement lors de modifications ou reconnexions MQTT.
+
+Les rafraîchissements identiques de `state` et `cp` ont
+`parse: false` : **ils ne relancent pas vos événements Domoticz**.
+Les véritables transitions conservent `parse: true`.
+
+Le paramètre optionnel `domoticz.measurement_refresh_seconds` vaut
+`300` par défaut, avec une plage autorisée de 10 à 300 secondes.
+Aucune mesure n'est inventée si le chargeur n'a pas encore envoyé son DP ;
+la passerelle ne promet pas de publier si le Feyree ou MQTT est hors ligne.
+
+### Sélecteur Off / Pause / On
+
+Pour exploiter `WaitOperation` directement depuis Domoticz :
+
+1. Créer un dispositif virtuel **Selector Switch** avec les niveaux
+   **0=Off, 10=Pause, 20=On** (nom des niveaux : `Off|Pause|On`,
+   niveau Off visible).
+2. Remplacer `domoticz.idx.switch` par l'IDX de ce nouveau sélecteur.
+3. Régler `domoticz.switch_mode` sur `"selector"` et conserver
+   `domoticz.write_enabled: true` si l'écriture fonctionne déjà.
+4. Redémarrer le service et tester les trois niveaux.
+
+La passerelle interprète le **niveau `svalue1`** publié par
+`domoticz/out`, et **non pas `nvalue`**, qui peut valoir 1 ou 2
+pour plusieurs niveaux actifs selon Domoticz. Elle valide strictement
+0, 10 ou 20 pour éviter d'envoyer une commande inattendue.
+
+| Sélecteur | Commande Feyree | Retour Domoticz |
+|---|---|---|
+| Off (0) | `CloseCharging` | `nvalue=0, svalue="0"` |
+| Pause (10) | `WaitOperation` | `nvalue=1, svalue="10"` |
+| On (20) | `OpenCharging` | `nvalue=1, svalue="20"` |
+
+La réception de `WaitOperation` à partir de l'application ou du
+chargeur met elle aussi le sélecteur sur **Pause**.
+Le mode précédent `"switch"` reste activé par défaut, afin que la
+mise à jour du code ne transforme pas l'ancien interrupteur en sélecteur
+sans modification volontaire de `config.json`.
 
 ### Conservation du compteur d'énergie
 
