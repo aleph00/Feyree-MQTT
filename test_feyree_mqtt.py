@@ -132,12 +132,12 @@ def test_domoticz_mqtt_mapping_and_energy_continuity(monkeypatch):
                'power_publish_seconds': 30,
                'idx': {'temperature': 200, 'voltage': 201, 'current': 202,
                        'power': 204, 'state': 205, 'cp': 208,
-                       'setpoint': 206, 'switch': 207}
+                       'setpoint': 206, 'delay': 209, 'switch': 207}
            }}
     g = m.Gateway(cfg)
     g.mqtt_connected = True
     g.ingest({'dps': {'110': 291, '102': 2300, '105': 82,
-                      '109': 18, '101': 'charing', '114': 8,
+                      '109': 18, '101': 'charing', '114': 8, '118': 15,
                       '124': 'OpenCharging', '127': 5}})
     messages = [json.loads(payload) for topic, payload in g.client.messages
                 if topic == 'domoticz/in']
@@ -152,6 +152,8 @@ def test_domoticz_mqtt_mapping_and_energy_continuity(monkeypatch):
     assert by_idx[208]['parse'] is True
     assert by_idx[206]['svalue'] == '8'
     assert by_idx[206]['parse'] is False
+    assert by_idx[209]['svalue'] == '15'
+    assert by_idx[209]['parse'] is False
     assert by_idx[207]['nvalue'] == 1
 
     # 30 s a 1800 W = 15 Wh, sans creer 30 publications par seconde.
@@ -325,3 +327,64 @@ def test_domoticz_on_connect_subscribes_only_when_write_enabled():
     g2.client.subscribe = lambda topic, qos=0: subscribed2.append((topic, qos))
     g2.on_connect(g2.client, None, None, 0)
     assert ('domoticz/out', 1) not in subscribed2
+
+
+def test_domoticz_delay_setpoint_bidirectional_without_loops(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    cfg = {'device_id': 'test', 'device_ip': '127.0.0.1',
+           'local_key': 'dummy',
+           'domoticz': {'enabled': True, 'write_enabled': True,
+                         'idx': {'delay': 209}}}
+    g = m.Gateway(cfg)
+    g.mqtt_connected = True
+    g.ingest({'dps': {'118': 15}})
+    published = [json.loads(payload) for topic, payload in g.client.messages
+                 if topic == 'domoticz/in']
+    assert published[-1] == {
+        'command': 'udevice', 'idx': 209, 'nvalue': 0, 'svalue': '15',
+        'parse': False
+    }
+
+    # Nouvelle valeur locale : publication immédiate, sans déclenchement de script.
+    clock[0] += 1
+    g.ingest({'dps': {'118': 12}})
+    published = [json.loads(payload) for topic, payload in g.client.messages
+                 if topic == 'domoticz/in']
+    assert published[-1]['svalue'] == '12'
+    assert published[-1]['parse'] is False
+    assert len(published) == 2
+
+    # Les updates identiques n'engendrent pas de publication supplémentaire.
+    g.ingest({'dps': {'118': 12}})
+    published = [json.loads(payload) for topic, payload in g.client.messages
+                 if topic == 'domoticz/in']
+    assert len(published) == 2
+
+    # La consigne issue de Domoticz repart vers DP118, dans la plage autorisée.
+    msg = types.SimpleNamespace(topic='domoticz/out', retain=False,
+                                payload=b'{"idx":209,"svalue1":"15.0"}')
+    g.on_message(None, None, msg)
+    assert g.queue.get_nowait() == (
+        {'action': 'delay', 'value': 15}, 118, 15)
+    # Renouveler la même durée reste possible par une nouvelle commande.
+    g.on_message(None, None, msg)
+    assert g.queue.get_nowait() == (
+        {'action': 'delay', 'value': 15}, 118, 15)
+
+
+def test_domoticz_delay_setpoint_rejects_invalid_values():
+    idx = {'delay': 209}
+    for raw in ('-1', '16', '7.5', 'NaN', 'Infinity', '', None):
+        try:
+            m.translate_domoticz_command({'idx': 209, 'svalue1': raw}, idx)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'Invalid delay accepted: {raw!r}')
+    assert m.translate_domoticz_command({'idx': 209, 'svalue1': '0'}, idx) == {
+        'action': 'delay', 'value': 0
+    }
+    assert m.translate_domoticz_command({'idx': 209, 'svalue1': '15'}, idx) == {
+        'action': 'delay', 'value': 15
+    }
