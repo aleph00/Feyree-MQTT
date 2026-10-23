@@ -94,20 +94,28 @@ def translate_domoticz_command(payload, indices):
         return None
 
     setpoint = indices.get("setpoint")
+    delay = indices.get("delay")
     switch = indices.get("switch")
-    if setpoint is not None and idx == int(setpoint):
+    # Deux consignes de type Setpoint, l'une pour les amperes (DP114)
+    # et l'autre pour le differé en heures (DP118).
+    for name, configured_idx, action in (
+        ("courant", setpoint, "current"),
+        ("départ différé", delay, "delay"),
+    ):
+        if configured_idx is None or idx != int(configured_idx):
+            continue
         # MQTT Domoticz sépare les champs en svalue1, svalue2...
         raw = payload.get("svalue1", payload.get("svalue"))
         try:
             numeric = float(raw)
         except (TypeError, ValueError):
-            raise ValueError("Consigne Domoticz absente ou non numérique")
+            raise ValueError("Consigne %s absente ou non numérique" % name)
         if not math.isfinite(numeric) or not numeric.is_integer():
-            raise ValueError("Consigne courant : entier attendu")
+            raise ValueError("Consigne %s : entier attendu" % name)
         value = int(numeric)
-        # Vérification stricte des limites identique à feyree/set.
-        translate_command({"action": "current", "value": value})
-        return {"action": "current", "value": value}
+        # Vérification stricte (8..16 A, 0..15 h) identique a feyree/set.
+        translate_command({"action": action, "value": value})
+        return {"action": action, "value": value}
 
     if switch is not None and idx == int(switch):
         state = payload.get("nvalue")
@@ -349,6 +357,7 @@ class Gateway:
             ("101", "state", str),
             ("127", "cp", int),  # Tension Control Pilot mesuree (V)
             ("114", "setpoint", int),
+            ("118", "delay", int),  # Duree de depart differe (heures)
         )
         for dp, name, conversion in scalar:
             if dp in dps and (force or dp in changed):
@@ -512,8 +521,8 @@ def main():
         if dz.get("write_enabled"):
             if dz.get("topic_in", "domoticz/in") == dz.get("topic_out", "domoticz/out"):
                 parser.error("Les topics Domoticz in et out doivent etre distincts")
-            if not (indices.get("setpoint") or indices.get("switch")):
-                parser.error("domoticz.write_enabled requiert un IDX setpoint ou switch")
+            if not (indices.get("setpoint") or indices.get("delay") or indices.get("switch")):
+                parser.error("domoticz.write_enabled requiert un IDX setpoint, delay ou switch")
     Gateway(cfg).run()
 
 
