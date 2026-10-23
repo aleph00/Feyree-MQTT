@@ -10,5 +10,20 @@
   "mqtt_password": "",
   "topic": "feyree",
   "poll_seconds": 60,
-  "dp120_publish_seconds": 30
+  "dp120_publish_seconds": 30,
+  "domoticz": {
+    "enabled": false,
+    "topic_in": "domoticz/in",
+    "http_url": "http://127.0.0.1:8080",
+    "power_publish_seconds": 60,
+    "idx": {
+      "temperature": null,
+      "voltage": null,
+      "current": null,
+      "power": null,
+      "state": null,
+      "setpoint": null,
+      "switch": null
+    }
+  }
 }
