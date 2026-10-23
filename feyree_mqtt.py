@@ -79,7 +79,7 @@ def translate_command(obj):
     raise ValueError("Action inconnue (start, stop, wait, current, delay, status)")
 
 
-def translate_domoticz_command(payload, indices):
+def translate_domoticz_command(payload, indices, switch_mode="switch"):
     """Traduit une notification domoticz/out en commande Feyree, ou None.
 
     Ce sont les commandes provenant des dispositifs utilisateur (pas les
@@ -118,6 +118,22 @@ def translate_domoticz_command(payload, indices):
         return {"action": action, "value": value}
 
     if switch is not None and idx == int(switch):
+        if switch_mode == "selector":
+            # Pour un selecteur Domoticz, nvalue peut etre 1 OU 2 sur
+            # les niveaux actifs : le niveau réel est dans svalue1.
+            raw = payload.get("svalue1", payload.get("svalue"))
+            if raw is None:
+                raise ValueError("Sélecteur Domoticz sans niveau svalue1")
+            try:
+                level = int(raw)
+            except (TypeError, ValueError):
+                raise ValueError("Niveau de sélecteur Domoticz invalide")
+            if str(raw).strip() != str(level):
+                raise ValueError("Niveau de sélecteur Domoticz invalide")
+            actions = {0: "stop", 10: "wait", 20: "start"}
+            if level not in actions:
+                raise ValueError("Niveau de sélecteur attendu : 0, 10 ou 20")
+            return {"action": actions[level]}
         state = payload.get("nvalue")
         if str(state) == "1":
             return {"action": "start"}
@@ -169,6 +185,10 @@ class Gateway:
         self.domo_topic = self.domoticz.get("topic_in", "domoticz/in")
         self.domo_out_topic = self.domoticz.get("topic_out", "domoticz/out")
         self.domo_write_enabled = bool(self.domoticz.get("write_enabled", False))
+        self.domo_switch_mode = self.domoticz.get("switch_mode", "switch")
+        self.measurement_refresh_seconds = float(
+            self.domoticz.get("measurement_refresh_seconds", 300))
+        self.domo_last_sent = {}
         self.domo_last = {}
         self.domo_sync_needed = True
         self.energy_wh = None
@@ -227,7 +247,8 @@ class Gateway:
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
             if topic == self.domo_out_topic:
-                obj = translate_domoticz_command(payload, self.domo_idx)
+                obj = translate_domoticz_command(
+                    payload, self.domo_idx, self.domo_switch_mode)
                 if obj is None:
                     return  # les autres dispositifs Domoticz sont ignorés
             else:
@@ -311,18 +332,28 @@ class Gateway:
         return True
 
 
-    def publish_domoticz(self, name, nvalue, svalue, *, trigger=False):
+    def measurement_due(self, name, now):
+        """Rafraichissement maximal pour les seules valeurs mesurees."""
+        last = self.domo_last_sent.get(name)
+        return last is None or now - last >= self.measurement_refresh_seconds
+
+    def publish_domoticz(self, name, nvalue, svalue, *,
+                         trigger=False, refresh=False, now=None):
         """Mise à jour d'un dispositif existant, identifie par son IDX."""
         idx = self.domo_idx.get(name)
         if not idx or not self.mqtt_connected:
             return
+        if now is None:
+            now = time.monotonic()
         payload = {"command": "udevice", "idx": int(idx),
                    "nvalue": nvalue, "svalue": str(svalue),
                    "parse": bool(trigger)}
         signature = (nvalue, str(svalue))
-        if self.domo_sync_needed or self.domo_last.get(name) != signature:
+        if (self.domo_sync_needed or self.domo_last.get(name) != signature
+                or (refresh and self.measurement_due(name, now))):
             self.publish(self.domo_topic, payload, retain=False)
             self.domo_last[name] = signature
+            self.domo_last_sent[name] = now
 
     def ensure_energy_seed(self, now):
         """Recupere le compteur deja existant dans Domoticz avant toute ecriture."""
@@ -359,20 +390,40 @@ class Gateway:
             ("114", "setpoint", int),
             ("118", "delay", int),  # Duree de depart differe (heures)
         )
+        measurements = {"temperature", "voltage", "current", "state", "cp"}
         for dp, name, conversion in scalar:
-            if dp in dps and (force or dp in changed):
+            if dp not in dps:
+                continue
+            is_measurement = name in measurements
+            if (force or dp in changed or
+                    (is_measurement and self.measurement_due(name, now))):
                 value = conversion(dps[dp])
-                # L'etat doit generer un evenement Domoticz pour les automatismes.
-                # Les synchronisations de consigne ne doivent pas produire de boucles.
-                self.publish_domoticz(name, 0, value, trigger=(name in ("state", "cp")))
+                # Les vrais changements state/CP declenchent les evenements ;
+                # un simple rafraichissement de courbe ne les declenche pas.
+                trigger = name in ("state", "cp") and dp in changed
+                self.publish_domoticz(
+                    name, 0, value, trigger=trigger, refresh=is_measurement,
+                    now=now)
 
         if "124" in dps and (force or "124" in changed):
             operation = dps["124"]
-            # WaitOperation = pause ; on n'impose pas Off sur un switch On/Off.
-            if operation == "OpenCharging":
-                self.publish_domoticz("switch", 1, "On")
-            elif operation == "CloseCharging":
-                self.publish_domoticz("switch", 0, "Off")
+            if self.domo_switch_mode == "selector":
+                # Off=0, Pause=10, On=20 ; les deux niveaux actifs
+                # ont nvalue=1, le niveau est dans svalue.
+                selector_values = {
+                    "CloseCharging": (0, "0"),
+                    "WaitOperation": (1, "10"),
+                    "OpenCharging": (1, "20"),
+                }
+                if operation in selector_values:
+                    nvalue, svalue = selector_values[operation]
+                    self.publish_domoticz("switch", nvalue, svalue, now=now)
+            else:
+                # Ancien interrupteur On/Off, pas de notion de pause.
+                if operation == "OpenCharging":
+                    self.publish_domoticz("switch", 1, "On", now=now)
+                elif operation == "CloseCharging":
+                    self.publish_domoticz("switch", 0, "Off", now=now)
 
         if "109" in dps:
             power_w = max(0.0, float(dps["109"]) * 100.0)
@@ -388,8 +439,10 @@ class Gateway:
                            now - self.last_power_pub >=
                            float(self.domoticz.get("power_publish_seconds", 60)))
             if self.energy_wh is not None and publish_due:
-                self.publish_domoticz("power", 0,
-                    "%s;%d" % (format(power_w, "g"), round(self.energy_wh)))
+                self.publish_domoticz(
+                    "power", 0,
+                    "%s;%d" % (format(power_w, "g"), round(self.energy_wh)),
+                    refresh=True, now=now)
                 self.last_power_pub = now
         if self.mqtt_connected:
             self.domo_sync_needed = False
@@ -462,6 +515,10 @@ class Gateway:
                         data = dev.receive()  # socket timeout: <= 1.5 s
                         if data is not None:
                             self.ingest(data)
+                        elif self.domo_enabled and self.available:
+                            # Meme si aucun DP ne change, rafraichir les
+                            # courbes via les dernieres valeurs connues.
+                            self.update_domoticz({}, time.monotonic())
                         if time.monotonic() - self.last_data > max(90, 2.5 * poll_every):
                             raise TimeoutError("Aucun état DP reçu depuis trop longtemps")
                     delay = 2
@@ -518,6 +575,11 @@ def main():
                 parser.error(f"domoticz.idx.{field} doit etre un IDX positif ou null")
         if float(dz.get("power_publish_seconds", 60)) < 5:
             parser.error("domoticz.power_publish_seconds doit etre >= 5")
+        refresh = float(dz.get("measurement_refresh_seconds", 300))
+        if not 10 <= refresh <= 300:
+            parser.error("domoticz.measurement_refresh_seconds doit etre entre 10 et 300")
+        if dz.get("switch_mode", "switch") not in ("switch", "selector"):
+            parser.error("domoticz.switch_mode doit etre switch ou selector")
         if dz.get("write_enabled"):
             if dz.get("topic_in", "domoticz/in") == dz.get("topic_out", "domoticz/out"):
                 parser.error("Les topics Domoticz in et out doivent etre distincts")
