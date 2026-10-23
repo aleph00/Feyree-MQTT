@@ -50,7 +50,29 @@ mosquitto_sub -v -t 'feyree/#'
 
 La passerelle garde une socket TCP persistante ; elle interroge l'état initial puis écoute `receive()`. Elle envoie un heartbeat toutes les 20 s, effectue un polling de secours toutes les 60 s par défaut et se reconnecte avec backoff. Un seul thread accède à la socket TinyTuya, ce qui évite les accès concurrents du callback MQTT. Pas de logique autonome `delay=15` ni d'autorisation de charge : à ajouter seulement lorsque le test de renouvellement du différé sera validé. En cas de redémarrage du Feyree, son différé s'efface selon vos essais : **ce script ne constitue pas un verrouillage de sécurité**.
 
-La valeur CP que vous avez constatée sur le DP127 : **11 voiture débranchée, 9 branchée en attente, 5 en charge**. Elle est publiée en brut et décodée sous `cp_v`.
+## Signal Control Pilot : DP 127 (`cp`)
+
+Sur le Feyree F-M24, le **DP 127** semble correspondre à la tension positive du signal **Control Pilot (CP)**, qui renseigne sur l'état électrique de connexion entre le chargeur et le véhicule (IEC 61851). Cette interprétation est étayée par les mesures suivantes **réalisées sur ce chargeur** :
+
+| Situation observée | DP 127 relevé | État CP / IEC 61851 | Tension CP nominale |
+|---|---:|---|---:|
+| Voiture débranchée | **11** | **A** — véhicule absent | +12 V |
+| Voiture branchée, en attente (*stand-by*) | **9** | **B** — véhicule connecté, non prêt à charger | +9 V |
+| Voiture branchée et en charge | **5** | **C** — véhicule prêt pour la charge | +6 V |
+
+Les valeurs 11, 9 et 5 sont **expérimentales**, propres aux mesures affichées par ce F-M24 ; les valeurs IEC 61851 indiquées dans la dernière colonne sont **nominales**. Un écart est possible selon les tolérances et la mesure interne de l'appareil. Les autres états CP (dont D et les états de défaut) n'ont pas été vérifiés sur ce chargeur.
+
+**Exploitation MQTT :**
+
+- `feyree/dp/127` : valeur brute du DP127, publiée lors d'un changement ;
+- `feyree/state` : valeur également disponible sous `dps["127"]`, et convertie en `decoded.cp_v` ;
+- `feyree/availability` : à consulter pour ne pas interpréter comme actuel un état MQTT retenu après une perte de communication.
+
+Pour la logique Domoticz, le DP127 est un indicateur utile de la **présence physique et de l'état de préparation du véhicule**, complémentaire du DP101 (`DeviceState`). Ne supposez pas que ces trois nombres sont les **seules** valeurs possibles : classez les états par plages validées expérimentalement plutôt que par égalité stricte.
+
+```sh
+mosquitto_sub -v -t 'feyree/dp/127'
+```
 
 ## Service systemd (optionnel)
 
