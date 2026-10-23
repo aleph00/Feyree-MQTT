@@ -8,6 +8,7 @@ les commandes. Pas de stratégie de charge automatique dans cette version.
 import argparse
 import json
 import logging
+import math
 import queue
 import re
 import signal
@@ -78,6 +79,52 @@ def translate_command(obj):
     raise ValueError("Action inconnue (start, stop, wait, current, delay, status)")
 
 
+def translate_domoticz_command(payload, indices):
+    """Traduit une notification domoticz/out en commande Feyree, ou None.
+
+    Ce sont les commandes provenant des dispositifs utilisateur (pas les
+    mises à jour domoticz/in). La prévention des boucles MQTT doit rester
+    activée dans le matériel MQTT Client Gateway de Domoticz.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("Notification Domoticz invalide")
+    try:
+        idx = int(payload["idx"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    setpoint = indices.get("setpoint")
+    switch = indices.get("switch")
+    if setpoint is not None and idx == int(setpoint):
+        # MQTT Domoticz sépare les champs en svalue1, svalue2...
+        raw = payload.get("svalue1", payload.get("svalue"))
+        try:
+            numeric = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError("Consigne Domoticz absente ou non numérique")
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            raise ValueError("Consigne courant : entier attendu")
+        value = int(numeric)
+        # Vérification stricte des limites identique à feyree/set.
+        translate_command({"action": "current", "value": value})
+        return {"action": "current", "value": value}
+
+    if switch is not None and idx == int(switch):
+        state = payload.get("nvalue")
+        if str(state) == "1":
+            return {"action": "start"}
+        if str(state) == "0":
+            return {"action": "stop"}
+        # Repli pour d'éventuels messages sans nvalue.
+        label = str(payload.get("svalue1", payload.get("svalue", ""))).lower()
+        if label == "on":
+            return {"action": "start"}
+        if label == "off":
+            return {"action": "stop"}
+        raise ValueError("État interrupteur Domoticz inconnu")
+    return None
+
+
 def read_domoticz_energy_wh(base_url, idx):
     """Lit le total existant du compteur Domoticz (sans jamais le réinitialiser).
 
@@ -112,6 +159,8 @@ class Gateway:
         self.domo_enabled = bool(self.domoticz.get("enabled", False))
         self.domo_idx = self.domoticz.get("idx") or {}
         self.domo_topic = self.domoticz.get("topic_in", "domoticz/in")
+        self.domo_out_topic = self.domoticz.get("topic_out", "domoticz/out")
+        self.domo_write_enabled = bool(self.domoticz.get("write_enabled", False))
         self.domo_last = {}
         self.domo_sync_needed = True
         self.energy_wh = None
@@ -145,6 +194,8 @@ class Gateway:
         self.mqtt_connected = True
         self.domo_sync_needed = True
         client.subscribe(self.root + "/set", qos=1)
+        if self.domo_enabled and self.domo_write_enabled:
+            client.subscribe(self.domo_out_topic, qos=1)
         # Une reconnexion du broker ne transforme pas un état périmé en état frais.
         self.publish_availability()
         if self.last_status is not None:
@@ -156,11 +207,23 @@ class Gateway:
         LOG.warning("MQTT déconnecté")
 
     def on_message(self, client, userdata, msg):
+        topic = getattr(msg, "topic", self.root + "/set")
+        if topic != self.root + "/set" and not (
+            self.domo_enabled and self.domo_write_enabled and
+            topic == self.domo_out_topic
+        ):
+            return
         if msg.retain:
-            LOG.warning("Commande MQTT retenue ignorée (sécurité)")
+            LOG.warning("Commande MQTT retenue ignorée (sécurité) : %s", topic)
             return
         try:
-            obj = json.loads(msg.payload.decode("utf-8"))
+            payload = json.loads(msg.payload.decode("utf-8"))
+            if topic == self.domo_out_topic:
+                obj = translate_domoticz_command(payload, self.domo_idx)
+                if obj is None:
+                    return  # les autres dispositifs Domoticz sont ignorés
+            else:
+                obj = payload
             dp, value = translate_command(obj)
             if not self.available:
                 raise ValueError("Chargeur hors ligne : commande non mémorisée")
@@ -446,6 +509,11 @@ def main():
                 parser.error(f"domoticz.idx.{field} doit etre un IDX positif ou null")
         if float(dz.get("power_publish_seconds", 60)) < 5:
             parser.error("domoticz.power_publish_seconds doit etre >= 5")
+        if dz.get("write_enabled"):
+            if dz.get("topic_in", "domoticz/in") == dz.get("topic_out", "domoticz/out"):
+                parser.error("Les topics Domoticz in et out doivent etre distincts")
+            if not (indices.get("setpoint") or indices.get("switch")):
+                parser.error("domoticz.write_enabled requiert un IDX setpoint ou switch")
     Gateway(cfg).run()
 
 
