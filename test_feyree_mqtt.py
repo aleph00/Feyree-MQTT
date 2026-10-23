@@ -214,3 +214,16 @@ def test_cp_change_triggers_immediate_domoticz_update(monkeypatch):
                 if topic == 'domoticz/in']
     assert [msg['svalue'] for msg in messages] == ['11', '9', '5']
     assert all(msg['idx'] == 208 and msg['parse'] is True for msg in messages)
+
+
+def test_read_domoticz_energy_wh_accepts_real_counter(monkeypatch):
+    from io import StringIO
+
+    def fake_api(url, timeout):
+        assert "rid=204" in url
+        return StringIO(json.dumps({
+            "result": [{"Data": "2825.173 kWh"}]
+        }))
+
+    monkeypatch.setattr(m, "urlopen", fake_api)
+    assert m.read_domoticz_energy_wh("http://localhost:8080", 204) == 2825173.0
