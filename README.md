@@ -118,8 +118,10 @@ exploiter directement le passage `11 → 9` pour armer le différé,
 sans que la passerelle décide elle-même quand charger.
 
 **Différé :** créer un dispositif virtuel Domoticz de type *Setpoint*
-nommé par exemple « Durée départ différé », avec une unité affichée en
-**h**, et placer son IDX dans `domoticz.idx.delay`. La passerelle accepte
+nommé par exemple « Durée départ différé ». Dans les réglages
+du Setpoint, renseignez l'unité **h**, un pas de **1**, un minimum de **0**
+et un maximum de **15** (options des versions récentes de Domoticz), puis
+placez son IDX dans `domoticz.idx.delay`. La passerelle accepte
 uniquement une durée **entière entre 0 et 15 heures** : tout nombre
 fractionnaire ou hors plage est refusé. Elle répercute aussi les
 modifications locales ou faites dans l'application Tuya, dès qu'un nouveau
