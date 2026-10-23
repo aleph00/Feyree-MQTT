@@ -28,6 +28,8 @@
       "switch": null
     },
     "topic_out": "domoticz/out",
-    "write_enabled": false
+    "write_enabled": false,
+    "measurement_refresh_seconds": 300,
+    "switch_mode": "switch"
   }
 }
