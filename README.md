@@ -29,6 +29,95 @@ Avec `topic: "feyree"` :
 
 `feyree/state` conserve les DP déjà connus lorsqu'une notification partielle ne contient que le DP 120. Le Feyree émet le compteur de durée **DP120 toutes les secondes pendant la charge** : pour éviter les publications MQTT inutiles, la passerelle garde toutes les valeurs dans son cache mais n'en publie qu'une toutes les **30 secondes par défaut** (avec le snapshot `feyree/state`). Une variation d’un autre DP reste publiée immédiatement, ainsi qu’une remise à zéro du compteur. Modifier `dp120_publish_seconds` dans `config.json` pour ajuster ce délai (`0` pour tout publier). Les données peuvent être anciennes après déconnexion : **vérifiez `feyree/availability`**. Les valeurs publiées dans `decoded` proviennent du mapping F-M24 que nous avons relevé. La remontée immédiate des transitions CP dépend de ce que le firmware pousse effectivement : **à mesurer**.
 
+## Intégration des dispositifs Domoticz existants
+
+Cette fonctionnalité est **facultative et désactivée par défaut**. Elle utilise le
+client MQTT déjà présent dans Domoticz et **ne crée aucun dispositif**.
+
+Dans votre `config.json`, ajoutez un bloc `domoticz` à la racine et remplacez
+les valeurs `null` par les **IDX de vos dispositifs existants** :
+
+```json
+"domoticz": {
+  "enabled": true,
+  "topic_in": "domoticz/in",
+  "http_url": "http://127.0.0.1:8080",
+  "power_publish_seconds": 60,
+  "idx": {
+    "temperature": null,
+    "voltage": null,
+    "current": null,
+    "power": null,
+    "state": null,
+    "setpoint": null,
+    "switch": null
+  }
+}
+```
+
+Vous pouvez laisser un IDX à `null` pour ignorer le dispositif correspondant.
+Le mapping est le suivant :
+
+| Clé d'IDX | Dispositif existant | Source Feyree | Mise à jour |
+|---|---|---|---|
+| `temperature` | Température Chargeur VE | DP 110 | °C, division par 10 |
+| `voltage` | Tension Charge VE | DP 102 | V, division par 10 |
+| `current` | Courant Charge VE | DP 105 | A, division par 10 |
+| `power` | Puissance Charge VE | DP 109 | W, multiplication par 100 + cumul Wh |
+| `state` | État VE (texte) | DP 101 | Texte brut, **`charing`** compris |
+| `setpoint` | Consigne courant VE | DP 114 | A, synchronisation sans déclenchement |
+| `switch` | Marche/arrêt VE | DP 124 | `OpenCharging` → On ; `CloseCharging` → Off |
+
+`WaitOperation` étant une **pause**, le switch On/Off existant n'est pas
+modifié dans ce cas. Le passage à un sélecteur Off/On/Pause sera une évolution
+distincte si souhaité.
+
+Les commandes sont uniquement **des remontées d'état vers Domoticz**. Les
+actions *de Domoticz vers le Feyree* restent celles de vos scripts existants ;
+pour les transférer en local, utilisez les commandes MQTT sur `feyree/set`.
+Les valeurs miroir du setpoint et du switch sont publiées avec
+`parse: false` pour éviter de déclencher une boucle de commandes ; l'état
+`state` est publié avec `parse: true` afin de pouvoir déclencher un événement
+Domoticz lors d'un changement.
+
+### Conservation du compteur d'énergie
+
+**Avant l'activation :** vérifiez l'IDX du compteur `Puissance Charge VE` et
+l'adresse HTTP de Domoticz. Ce compteur doit être un dispositif **Electricity
+(instant + counter)** et conserver le mode **Energy read: From Device** si
+c'était son mode précédent.
+
+Au démarrage, la passerelle lit via l'API HTTP le **total existant en kWh**
+puis le convertit en Wh. Elle n'écrit jamais une valeur nulle à la place du
+compteur si cette lecture échoue (par exemple lorsque l'API exige une
+authentification). Elle réessaie toutes les 60 s jusqu'à la réussite.
+
+Le cumul d'énergie est ensuite intégré sur la base du temps effectivement
+écoulé et de la puissance mesurée précédemment (pas à chaque message DP 120).
+La puissance et le total Wh sont envoyés à `domoticz/in` toutes les
+`power_publish_seconds` (60 s par défaut), ou immédiatement si la puissance
+change. Les intervalles de communication excessivement longs ne sont pas
+extrapolés pour éviter de créer des consommations fictives.
+
+**Ne laissez pas tourner l'ancien polling Lua en parallèle**, en particulier
+sa ligne qui ajoute `DeviceW/60` : cela doublerait les incréments d'énergie.
+Vous pourrez le désactiver après vérification des mises à jour MQTT.
+
+### Automatisations existantes
+
+La passerelle ne gère **ni le timer `$timer Charge Voiture` ni le départ
+différé** : ces règles restent dans Domoticz. Votre ancien code de polling
+contenait une détection de transitions (`charing` → `finish` /
+`no_connet` et inversement). Si vous supprimez son exécution périodique,
+conservez cette logique dans un événement Domoticz déclenché par la mise à
+jour du dispositif `state` (ou équivalent dzVents), afin de maintenir le
+timer et ses `Off AFTER 300` existants.
+
+**Test recommandé :** activez d'abord uniquement les IDX `state`,
+`voltage`, `current` et `setpoint`, puis `power` après avoir vérifié
+que l'API retourne bien le total d'énergie. Un IDX invalide ne doit jamais
+être remplacé par un nouvel IDX créé pour l'occasion.
+
 ## Commandes
 
 ```sh
