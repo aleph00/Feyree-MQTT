@@ -1,0 +1,13 @@
+{
+  "device_id": "ID_TUYA_DU_FEYREE",
+  "device_ip": "192.168.1.123",
+  "local_key": "CLE_LOCALE_TUYA",
+  "protocol_version": 3.3,
+  "mqtt_host": "127.0.0.1",
+  "mqtt_port": 1883,
+  "mqtt_client_id": "feyree-mqtt",
+  "mqtt_username": "",
+  "mqtt_password": "",
+  "topic": "feyree",
+  "poll_seconds": 60
+}
