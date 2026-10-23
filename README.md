@@ -41,6 +41,8 @@ les valeurs `null` par les **IDX de vos dispositifs existants** :
 "domoticz": {
   "enabled": true,
   "topic_in": "domoticz/in",
+  "topic_out": "domoticz/out",
+  "write_enabled": false,
   "http_url": "http://127.0.0.1:8080",
   "power_publish_seconds": 60,
   "idx": {
@@ -74,9 +76,33 @@ Le mapping est le suivant :
 modifié dans ce cas. Le passage à un sélecteur Off/On/Pause sera une évolution
 distincte si souhaité.
 
-Les commandes sont uniquement **des remontées d'état vers Domoticz**. Les
-actions *de Domoticz vers le Feyree* restent celles de vos scripts existants ;
-pour les transférer en local, utilisez les commandes MQTT sur `feyree/set`.
+Les remontées d'état vers Domoticz fonctionnent dès que `domoticz.enabled`
+est à `true`. Le trajet inverse est **facultatif**, avec
+`domoticz.write_enabled` réglé à `false` par défaut.
+
+Pour piloter le Feyree à partir des **dispositifs Domoticz déjà existants**,
+mettez `write_enabled: true` (avec la syntaxe JSON habituelle) après
+vérification des réglages du matériel **MQTT Client Gateway** :
+**Publish Topic : out (Flat)** et surtout **Prevent Loop : True**.
+La passerelle écoute alors `domoticz/out` et n'interprète que les IDX
+`setpoint` et `switch` que vous avez configurés :
+
+| Action dans Domoticz | Commande TinyTuya |
+|---|---|
+| Setpoint modifié à 8…16 A | DP114 = intensité demandée |
+| Switch On | DP124 = `OpenCharging` |
+| Switch Off | DP124 = `CloseCharging` |
+
+Un message `domoticz/out` ne correspondant pas à ces deux IDX est ignoré.
+Les commandes retenues MQTT, non valides, ou reçues pendant que le Feyree
+est hors ligne ne sont **jamais rejouées**. Les commandes directes sur
+`feyree/set` continuent de fonctionner. Le bouton **Pause** n'est
+pas encore géré par le switch On/Off : il reste accessible par
+`{"action":"wait"}` sur `feyree/set`.
+
+**Évitez d'exécuter en parallèle votre ancienne logique Lua d'envoi
+de commandes vers Tuya** : elle pourrait doubler ou contredire les
+commandes prises en charge par `domoticz/out`.
 Les valeurs miroir du setpoint et du switch sont publiées avec
 `parse: false` pour éviter de déclencher une boucle de commandes ; **`state`
 et `cp` sont publiés avec `parse: true`** afin de permettre à vos
@@ -125,6 +151,20 @@ timer et ses `Off AFTER 300` existants.
 `cp`, `voltage`, `current` et `setpoint`, puis `power` après avoir vérifié
 que l'API retourne bien le total d'énergie. Un IDX invalide ne doit jamais
 être remplacé par un nouvel IDX créé pour l'occasion.
+
+Pour tester ensuite le **sens Domoticz → Feyree** sans ambiguïté :
+1. Conserver `write_enabled: false` et vérifier, avec
+   `mosquitto_sub -v -t domoticz/out`, qu'un changement manuel de la
+   consigne publie bien l'IDX et un champ `svalue1` numérique.
+2. Activer `write_enabled: true`, redémarrer la passerelle et effectuer
+   un petit changement de consigne (par exemple de 8 à 9 A).
+3. Vérifier `feyree/ack` et la remontée du nouveau DP114, puis
+   tester On/Off seulement dans des conditions de charge maîtrisées.
+
+Le sujet `domoticz/out` doit bien correspondre au mode de publication
+de votre MQTT Client Gateway ; le mode *Index* utilise d'autres topics
+(`domoticz/out/<idx>`) et n'est pas pris en charge par cette configuration
+sans adaptation.
 
 ## Commandes
 
