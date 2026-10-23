@@ -30,10 +30,42 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# DP10 (fault), ordre des 16 bits documente dans devices.json du F-M24.
+FAULT_LABELS = (
+    "err_leak", "err_cp", "err_temp",
+    "warn_a_uvp", "warn_b_uvp", "warn_c_uvp",
+    "err_a_ovp", "err_b_ovp", "err_c_ovp",
+    "err_ocp", "err_10", "err_11", "err_esb",
+    "warn_pe_sck", "err_leak_sck", "err_pe",
+)
+
+
+def format_faults(raw):
+    """Renvoie 'masque - erreur1, erreur2' depuis le bitmap Tuya DP10."""
+    if isinstance(raw, bool):
+        raise ValueError("Bitmap de défaut invalide (booléen)")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Bitmap de défaut non numérique") from exc
+    if value < 0 or isinstance(raw, float) and not raw.is_integer():
+        raise ValueError("Bitmap de défaut invalide")
+    if value == 0:
+        return "0 - aucune erreur"
+    errors = [name for bit, name in enumerate(FAULT_LABELS)
+              if value & (1 << bit)]
+    # Ne pas masquer un bit inconnu si le firmware etend son bitmap.
+    errors.extend("bit_%d_inconnu" % bit
+                  for bit in range(len(FAULT_LABELS), value.bit_length())
+                  if value & (1 << bit))
+    return "%d - %s" % (value, ", ".join(errors))
+
+
 def decode(dps):
     """Champs interprétés d'après le mapping F-M24; les DP bruts restent publiés."""
     out = {}
     mapping = {
+        "10": ("fault_text", format_faults),
         "101": ("device_state", lambda v: str(v)),
         "102": ("voltage_v", lambda v: v / 10.0),
         "105": ("current_a", lambda v: v / 10.0),
@@ -388,11 +420,14 @@ class Gateway:
             ("102", "voltage", lambda v: v / 10.0),
             ("105", "current", lambda v: v / 10.0),
             ("101", "state", str),
+            ("10", "fault", format_faults),  # Diagnostic texte DP10
             ("127", "cp", int),  # Tension Control Pilot mesuree (V)
             ("114", "setpoint", int),
             ("118", "delay", int),  # Duree de depart differe (heures)
         )
-        measurements = {"temperature", "voltage", "current", "state", "cp"}
+        # Les dispositifs texte (state, fault) ne sont pas rafraichis
+        # periodiquement : les courbes concernent seulement les mesures.
+        measurements = {"temperature", "voltage", "current", "cp"}
         for dp, name, conversion in scalar:
             if dp not in dps:
                 continue
@@ -402,7 +437,7 @@ class Gateway:
                 value = conversion(dps[dp])
                 # Les vrais changements state/CP declenchent les evenements ;
                 # un simple rafraichissement de courbe ne les declenche pas.
-                trigger = name in ("state", "cp") and dp in changed
+                trigger = name in ("state", "fault", "cp") and dp in changed
                 self.publish_domoticz(
                     name, 0, value, trigger=trigger, refresh=is_measurement,
                     now=now)
