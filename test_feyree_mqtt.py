@@ -112,3 +112,85 @@ def test_dp120_alone_does_not_publish_global_state_every_second(monkeypatch):
     g.ingest({'dps': {'120': '00:00:02'}})
     assert len(g.client.messages) == first
     assert g.dps['120'] == '00:00:02'
+
+
+
+def test_domoticz_mqtt_mapping_and_energy_continuity(monkeypatch):
+    from io import StringIO
+    clock = [100.0]
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+
+    def fake_api(url, timeout):
+        assert 'rid=204' in url
+        return StringIO(json.dumps({"result": [{"Data": "4.250 kWh"}]}))
+
+    monkeypatch.setattr(m, "urlopen", fake_api)
+    cfg = {'device_id': 'test', 'device_ip': '127.0.0.1',
+           'local_key': 'dummy',
+           'domoticz': {
+               'enabled': True, 'http_url': 'http://127.0.0.1:8080',
+               'power_publish_seconds': 30,
+               'idx': {'temperature': 200, 'voltage': 201, 'current': 202,
+                       'power': 204, 'state': 205, 'setpoint': 206,
+                       'switch': 207}
+           }}
+    g = m.Gateway(cfg)
+    g.mqtt_connected = True
+    g.ingest({'dps': {'110': 291, '102': 2300, '105': 82,
+                      '109': 18, '101': 'charing', '114': 8,
+                      '124': 'OpenCharging', '127': 5}})
+    messages = [json.loads(payload) for topic, payload in g.client.messages
+                if topic == 'domoticz/in']
+    by_idx = {int(payload['idx']): payload for payload in messages}
+    assert by_idx[200]['svalue'] == '29.1'
+    assert by_idx[201]['svalue'] == '230.0'
+    assert by_idx[202]['svalue'] == '8.2'
+    assert by_idx[204]['svalue'] == '1800;4250'
+    assert by_idx[205]['svalue'] == 'charing'
+    assert by_idx[205]['parse'] is True
+    assert by_idx[206]['svalue'] == '8'
+    assert by_idx[206]['parse'] is False
+    assert by_idx[207]['nvalue'] == 1
+
+    # 30 s a 1800 W = 15 Wh, sans creer 30 publications par seconde.
+    n = len(messages)
+    clock[0] = 130.0
+    g.ingest({'dps': {'120': '00:00:30'}})
+    messages = [json.loads(payload) for topic, payload in g.client.messages
+                if topic == 'domoticz/in']
+    assert len(messages) == n + 1
+    assert messages[-1]['idx'] == 204
+    assert messages[-1]['svalue'] == '1800;4265'
+
+    # Pause ne fait PAS passer l'interrupteur existant à Off.
+    clock[0] = 131.0
+    g.ingest({'dps': {'124': 'WaitOperation'}})
+    messages = [json.loads(payload) for topic, payload in g.client.messages
+                if topic == 'domoticz/in']
+    assert not any(v['idx'] == 207 and v['nvalue'] == 0 for v in messages)
+
+    clock[0] = 132.0
+    g.ingest({'dps': {'124': 'CloseCharging', '109': 0, '101': 'finish'}})
+    messages = [json.loads(payload) for topic, payload in g.client.messages
+                if topic == 'domoticz/in']
+    assert any(v['idx'] == 207 and v['nvalue'] == 0 for v in messages)
+    assert any(v['idx'] == 205 and v['svalue'] == 'finish' for v in messages)
+
+
+def test_domoticz_energy_unavailable_does_not_reset_counter(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    def unavailable(url, timeout):
+        raise OSError("Domoticz offline")
+    monkeypatch.setattr(m, "urlopen", unavailable)
+    cfg = {'device_id':'test', 'device_ip':'127.0.0.1','local_key':'dummy',
+           'domoticz': {'enabled':True, 'http_url':'http://127.0.0.1:8080',
+                         'idx':{'power': 204, 'voltage': 201}}}
+    g = m.Gateway(cfg)
+    g.mqtt_connected = True
+    g.ingest({'dps': {'102': 2300, '109': 18}})
+    payloads = [json.loads(p) for topic, p in g.client.messages
+                if topic == 'domoticz/in']
+    assert any(v['idx'] == 201 for v in payloads)
+    assert not any(v['idx'] == 204 for v in payloads)
+    assert g.energy_wh is None
