@@ -284,6 +284,7 @@ class Gateway:
             ("102", "voltage", lambda v: v / 10.0),
             ("105", "current", lambda v: v / 10.0),
             ("101", "state", str),
+            ("127", "cp", int),  # Tension Control Pilot mesuree (V)
             ("114", "setpoint", int),
         )
         for dp, name, conversion in scalar:
@@ -291,7 +292,7 @@ class Gateway:
                 value = conversion(dps[dp])
                 # L'etat doit generer un evenement Domoticz pour les automatismes.
                 # Les synchronisations de consigne ne doivent pas produire de boucles.
-                self.publish_domoticz(name, 0, value, trigger=(name == "state"))
+                self.publish_domoticz(name, 0, value, trigger=(name in ("state", "cp")))
 
         if "124" in dps and (force or "124" in changed):
             operation = dps["124"]
