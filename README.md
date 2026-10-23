@@ -53,6 +53,7 @@ les valeurs `null` par les **IDX de vos dispositifs existants** :
     "state": null,
     "cp": null,
     "setpoint": null,
+    "delay": null,
     "switch": null
   }
 }
@@ -70,6 +71,7 @@ Le mapping est le suivant :
 | `state` | État VE (texte) | DP 101 | Texte brut, **`charing`** compris |
 | `cp` | Control Pilot (capteur personnalisé en V) | DP 127 | Valeur entière mesurée, par exemple 11/9/5 V |
 | `setpoint` | Consigne courant VE | DP 114 | A, synchronisation sans déclenchement |
+| `delay` | Durée départ différé (setpoint) | DP 118 | Heures entières, de 0 à 15 h, synchronisation sans déclenchement |
 | `switch` | Marche/arrêt VE | DP 124 | `OpenCharging` → On ; `CloseCharging` → Off |
 
 `WaitOperation` étant une **pause**, le switch On/Off existant n'est pas
@@ -85,15 +87,16 @@ mettez `write_enabled: true` (avec la syntaxe JSON habituelle) après
 vérification des réglages du matériel **MQTT Client Gateway** :
 **Publish Topic : out (Flat)** et surtout **Prevent Loop : True**.
 La passerelle écoute alors `domoticz/out` et n'interprète que les IDX
-`setpoint` et `switch` que vous avez configurés :
+`setpoint`, `delay` et `switch` que vous avez configurés :
 
 | Action dans Domoticz | Commande TinyTuya |
 |---|---|
 | Setpoint modifié à 8…16 A | DP114 = intensité demandée |
+| Durée départ différé modifiée à 0…15 h | DP118 = nouvelle durée de différé |
 | Switch On | DP124 = `OpenCharging` |
 | Switch Off | DP124 = `CloseCharging` |
 
-Un message `domoticz/out` ne correspondant pas à ces deux IDX est ignoré.
+Un message `domoticz/out` ne correspondant pas à ces trois IDX est ignoré.
 Les commandes retenues MQTT, non valides, ou reçues pendant que le Feyree
 est hors ligne ne sont **jamais rejouées**. Les commandes directes sur
 `feyree/set` continuent de fonctionner. Le bouton **Pause** n'est
@@ -103,7 +106,7 @@ pas encore géré par le switch On/Off : il reste accessible par
 **Évitez d'exécuter en parallèle votre ancienne logique Lua d'envoi
 de commandes vers Tuya** : elle pourrait doubler ou contredire les
 commandes prises en charge par `domoticz/out`.
-Les valeurs miroir du setpoint et du switch sont publiées avec
+Les valeurs miroir des deux setpoints (courant et différé) et du switch sont publiées avec
 `parse: false` pour éviter de déclencher une boucle de commandes ; **`state`
 et `cp` sont publiés avec `parse: true`** afin de permettre à vos
 automatismes Domoticz de réagir immédiatement aux changements.
@@ -113,6 +116,17 @@ logique. Vos relevés du F-M24 sont : **11 V** voiture absente, **9 V**
 voiture branchée en attente, **5 V** en charge. Vous pourrez ainsi
 exploiter directement le passage `11 → 9` pour armer le différé,
 sans que la passerelle décide elle-même quand charger.
+
+**Différé :** créer un dispositif virtuel Domoticz de type *Setpoint*
+nommé par exemple « Durée départ différé », avec une unité affichée en
+**h**, et placer son IDX dans `domoticz.idx.delay`. La passerelle accepte
+uniquement une durée **entière entre 0 et 15 heures** : tout nombre
+fractionnaire ou hors plage est refusé. Elle répercute aussi les
+modifications locales ou faites dans l'application Tuya, dès qu'un nouveau
+DP118 est reçu. L'envoi répété de `15` peut renouveler le différé
+pendant l'attente, conformément à votre essai ; **aucun renouvellement
+automatique n'est ajouté dans la passerelle**. Cette décision restera dans
+vos scripts Domoticz.
 
 ### Conservation du compteur d'énergie
 
