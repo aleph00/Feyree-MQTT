@@ -400,28 +400,31 @@ def test_domoticz_periodic_refresh_only_measurements(monkeypatch):
            'domoticz': {
                'enabled': True, 'measurement_refresh_seconds': 300,
                'idx': {'voltage': 201, 'current': 202,
-                       'temperature': 203, 'state': 205, 'cp': 208,
-                       'setpoint': 206, 'delay': 209, 'switch': 207}
+                       'temperature': 203, 'state': 205, 'fault': 210,
+                       'cp': 208, 'setpoint': 206, 'delay': 209, 'switch': 207}
            }}
     g = m.Gateway(cfg)
     g.mqtt_connected = True
     g.ingest({'dps': {'102': 2300, '105': 0, '110': 220,
-                      '101': 'finish', '127': 11, '114': 8,
+                      '101': 'finish', '10': 0, '127': 11, '114': 8,
                       '118': 15, '124': 'CloseCharging'}})
 
     def messages():
         return [json.loads(p) for t, p in g.client.messages if t == 'domoticz/in']
 
-    assert len(messages()) == 8
+    assert len(messages()) == 9
+    assert next(p for p in messages() if p['idx'] == 210)['svalue'] == (
+        '0 - aucune erreur')
     clock[0] = 399.0
     g.update_domoticz({}, clock[0])   # matériel vivant, aucune variation
-    assert len(messages()) == 8
+    assert len(messages()) == 9
 
     clock[0] = 400.0
     g.update_domoticz({}, clock[0])
-    later = messages()[8:]
-    assert {p['idx'] for p in later} == {201, 202, 203, 205, 208}
-    assert len(later) == 5
+    later = messages()[9:]
+    # State et fault sont des textes : aucun rafraichissement periodique.
+    assert {p['idx'] for p in later} == {201, 202, 203, 208}
+    assert len(later) == 4
     # Un simple rafraîchissement ne doit pas réveiller les timers Lua.
     assert all(p['parse'] is False for p in later)
 
@@ -516,3 +519,77 @@ def test_selector_device_reflects_wait_start_stop(monkeypatch):
         g.on_message(None, None, msg)
         obj, dp, value = g.queue.get_nowait()
         assert (obj['action'], dp, value) == (action, 124, dp_value)
+
+
+def test_fault_bitmap_labels_exact_order_and_unknown_bits():
+    assert len(m.FAULT_LABELS) == 16
+    assert m.format_faults(0) == "0 - aucune erreur"
+    assert m.format_faults("0") == "0 - aucune erreur"
+    assert m.format_faults(1) == "1 - err_leak"
+    assert m.format_faults(2) == "2 - err_cp"
+    assert m.format_faults(4) == "4 - err_temp"
+    assert m.format_faults(512) == "512 - err_ocp"
+    assert m.format_faults(0x8000) == "32768 - err_pe"
+    assert m.format_faults(5) == "5 - err_leak, err_temp"
+    assert m.format_faults(65535) == (
+        "65535 - " + ", ".join(m.FAULT_LABELS))
+    assert m.format_faults(65536) == "65536 - bit_16_inconnu"
+    for invalid in (True, -1, None, "", "invalide", 2.5):
+        try:
+            m.format_faults(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Bitmap DP10 invalide accepté : {invalid!r}")
+
+    assert m.decode({"10": 5})["fault_text"] == "5 - err_leak, err_temp"
+    assert "fault_text" not in m.decode({"10": "invalide"})
+
+
+def test_fault_text_domoticz_only_on_changes_and_reconnect(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    g = m.Gateway({
+        'device_id': 'test', 'device_ip': '127.0.0.1',
+        'local_key': 'dummy', 'domoticz': {
+            'enabled': True, 'measurement_refresh_seconds': 300,
+            'idx': {'fault': 210}
+        }
+    })
+    g.mqtt_connected = True
+    def faults():
+        return [json.loads(p) for topic, p in g.client.messages
+                if topic == 'domoticz/in']
+
+    g.ingest({'dps': {'10': 0}})
+    assert faults() == [{
+        'command': 'udevice', 'idx': 210, 'nvalue': 0,
+        'svalue': '0 - aucune erreur', 'parse': True
+    }]
+    # Pas de rafraîchissement du texte après 5 min, même en réception de DP120.
+    clock[0] = 401
+    g.ingest({'dps': {'120': '00:06:01'}})
+    g.update_domoticz({}, clock[0])
+    assert len(faults()) == 1
+
+    clock[0] = 402
+    g.ingest({'dps': {'10': 5}})
+    assert faults()[-1]['svalue'] == "5 - err_leak, err_temp"
+    assert faults()[-1]['parse'] is True
+    assert len(faults()) == 2
+    clock[0] = 403
+    g.ingest({'dps': {'10': 5}})
+    assert len(faults()) == 2
+
+    # Le retour à zéro apparaît sans délai.
+    clock[0] = 404
+    g.ingest({'dps': {'10': 0}})
+    assert faults()[-1]['svalue'] == '0 - aucune erreur'
+    assert len(faults()) == 3
+
+    # Resynchronisation après reconnexion au broker.
+    g.domo_sync_needed = True
+    g.update_domoticz({}, 405)
+    assert faults()[-1]['svalue'] == '0 - aucune erreur'
+    assert faults()[-1]['parse'] is False
+    assert len(faults()) == 4
